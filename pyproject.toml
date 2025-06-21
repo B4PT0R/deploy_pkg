@@ -1,6 +1,6 @@
 [project]
 name = "deploy_pkg"
-version = "0.0.6"
+version = "0.0.7"
 description = "One-shot bootstrap & deploy script for Python packages (git+GitHub+PyPI)."
 readme = "README.md"
 requires-python = ">=3.8"
