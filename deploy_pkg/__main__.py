@@ -1,277 +1,244 @@
 #!/usr/bin/env python3
 """
-deploy_pkg
-=========
+deploy.py – robuste + logs d’étapes
+----------------------------------
 
-Script « one-shot » pour :
+Pipeline entièrement automatisé :
+    1. Vérif pré-requis (git, libs Python, token GitHub)
+    2. Bootstrap fichiers (pyproject, README, LICENCE, .gitignore, …)
+    3. Nettoyage build/
+    4. Bump patch de version (format X.Y.Z)
+    5. Build éventuel frontend npm
+    6. Build paquet Python + install -e .
+    7. Git init / remote / push / tag
+    8. Upload dist/* sur PyPI via Twine
 
-1. Vérifier la présence de Git (sinon erreur explicite).
-2. Installer au vol les dépendances Python requises (build, twine, toml,
-   python-dotenv, requests) si elles manquent.
-3. Charger `.env` ; récupérer GITHUB_TOKEN (+ éventuel PKG_NAME).
-4. Déterminer le nom du paquet :
-      - s’il existe déjà un pyproject.toml → on récupère `project.name`
-      - sinon PKG_NAME dans .env → sinon nom du dossier racine
-5. Interroger l’API GitHub pour obtenir nom complet, email et login.
-6. Créer automatiquement (si absent) :
-      - pyproject.toml (PEP 621 complet, version 0.0.1)
-      - README.md, LICENSE (MIT), MANIFEST.in, .gitignore
-      - Avertir si le nom est déjà pris sur PyPI.
-7. Nettoyer build/ dist/ *.egg-info/ __pycache__/ etc.
-8. Incrémenter le patch de version dans pyproject.toml.
-9. S’il existe un `package.json` quelque part :
-      - bump de version
-      - `npm install` puis `npm run build`.
-10. Construire le paquet Python (`python -m build`).
-11. Installer/mettre à jour localement en mode editable (`pip install -U -e .`).
-12. Initialiser Git s’il n’existe pas, premier commit, .gitignore.
-13. Créer le repo GitHub via l’API si `origin` absent, ajouter remote,
-    push branche main.
-14. Commit « patch update #<version> », tag `v<version>`, push + tags.
-15. Publier `dist/*` sur PyPI avec Twine.
-
-Aucun prompt, tout est automatique.
+Chaque étape est loggée ; en cas d’échec, message clair – pas de traceback
+brut.
 """
 
+# ────────────────────────── IMPORTS STANDARD ─────────────────────────
 import os
 import sys
+import json
 import shutil
 import subprocess
-import json
+import textwrap
 from pathlib import Path
+from contextlib import contextmanager
 
-# ----------------------------------------------------------------------
-# 0. Vérifier la présence de Git
-# ----------------------------------------------------------------------
-import shutil as _shutil
-if _shutil.which("git") is None:
-    sys.exit("❌ Git n’est pas installé ou indisponible dans le PATH.")
+# ────────────────────────── LOGGING HELPERS ──────────────────────────
+def log(step: str, msg: str):
+    print(f"▶️  [{step}] {msg}")
 
-# ----------------------------------------------------------------------
-# 1. Installer/charger les libs tierces au besoin
-# ----------------------------------------------------------------------
-def ensure_tools():
+def fail(step: str, msg: str, code: int = 1):
+    print(f"❌ [{step}] {msg}")
+    sys.exit(code)
+
+def run(cmd, step, cwd=None, quiet=False):
+    """Subprocess wrapper avec message d’erreur propre."""
+    if not quiet:
+        log(step, " ".join(cmd))
+    try:
+        subprocess.run(cmd, cwd=cwd, check=True)
+    except subprocess.CalledProcessError as e:
+        fail(step, f"commande « {' '.join(e.cmd)} » → code {e.returncode}")
+
+@contextmanager
+def step(name: str):
+    log(name, "démarrage…")
+    try:
+        yield
+        log(name, "OK")
+    except Exception as exc:
+        fail(name, str(exc))
+
+# ────────────────────────── PRÉ-REQUIS SYSTÈME ───────────────────────
+if shutil.which("git") is None:
+    fail("Pré-requis", "git introuvable dans le PATH")
+
+# ────────────────────────── LIBS PYTHON ──────────────────────────────
+def ensure_libs():
     try:
         import toml, build, twine, dotenv, requests  # noqa
     except ImportError:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade",
-             "build", "twine", "toml", "python-dotenv", "requests"],
-            check=True
+        run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "build",
+                "twine",
+                "toml",
+                "python-dotenv",
+                "requests",
+            ],
+            step="Install dépendances",
+            quiet=True,
         )
 
-ensure_tools()
 
-import toml
-import requests
+ensure_libs()
+import toml, requests
 from dotenv import load_dotenv
+from requests.exceptions import RequestException
 
-# ----------------------------------------------------------------------
-# 2. Contexte & helpers
-# ----------------------------------------------------------------------
+# ────────────────────────── FONCTIONS UTIL ───────────────────────────
+def safe_get(url, **kw):
+    try:
+        return requests.get(url, timeout=10, **kw)
+    except RequestException as e:
+        raise RuntimeError(f"erreur réseau : {e}") from None
+
+def bump_patch(version: str) -> str:
+    """Incrémente le patch X.Y.Z → X.Y.(Z+1) avec validation."""
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise RuntimeError(f"format de version invalide : « {version} »")
+    major, minor, patch = map(int, parts)
+    return f"{major}.{minor}.{patch + 1}"
+
+# ────────────────────────── CONTEXTE GLOBAL ─────────────────────────
 ROOT = Path.cwd()
 PYPROJECT = ROOT / "pyproject.toml"
 
-def run(cmd, **kw):
-    """simple wrapper check=True"""
-    subprocess.run(cmd, check=True, **kw)
-
-def bump_patch(v: str) -> str:
-    major, minor, patch = map(int, v.split('.'))
-    return f"{major}.{minor}.{patch + 1}"
-
-def pypi_name_taken(name: str) -> bool:
-    return requests.get(f"https://pypi.org/pypi/{name}/json").status_code == 200
-
-def git(*args):
-    run(["git", *args])
-
-# ----------------------------------------------------------------------
-# 3. Charger .env ; récupérer le token GitHub et PKG_NAME override
-# ----------------------------------------------------------------------
 load_dotenv()
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-if not GITHUB_TOKEN:
-    sys.exit("❌ GITHUB_TOKEN manquant dans .env")
-
-PKG_NAME_ENV = os.getenv("PKG_NAME")  # facultatif
-
-# ----------------------------------------------------------------------
-# 4. Déterminer le nom du paquet
-# ----------------------------------------------------------------------
-if PYPROJECT.exists():
-    data_tmp = toml.load(PYPROJECT)
-    PKG_NAME = data_tmp["project"]["name"]
-else:
-    PKG_NAME = PKG_NAME_ENV or ROOT.name.replace(" ", "_")
-
-# ----------------------------------------------------------------------
-# 5. Infos développeur depuis GitHub
-# ----------------------------------------------------------------------
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or fail("ENV", "GITHUB_TOKEN manquant dans .env")
 HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
-user_json = requests.get("https://api.github.com/user", headers=HEADERS).json()
-GH_LOGIN = user_json.get("login") or "unknown"
-GH_NAME  = user_json.get("name")  or GH_LOGIN
-GH_EMAIL = (user_json.get("email")
-            or f"{GH_LOGIN}@users.noreply.github.com")
 
-# ----------------------------------------------------------------------
-# 6. Bootstrapping fichiers de base si absents
-# ----------------------------------------------------------------------
-if not PYPROJECT.exists():
-    if pypi_name_taken(PKG_NAME):
-        print(f"⚠️  Le nom « {PKG_NAME} » est déjà utilisé sur PyPI.")
-    print("📝 Création pyproject.toml…")
-    PYPROJECT.write_text(toml.dumps({
-        "project": {
-            "name": PKG_NAME,
-            "version": "0.0.1",
-            "description": "",
-            "readme": "README.md",
-            "license": {"text": "MIT"},
-            "authors": [{"name": GH_NAME, "email": GH_EMAIL}],
-            "requires-python": ">=3.8",
-            "dependencies": [],
-        },
-        "build-system": {
-            "requires": ["setuptools>=64", "wheel"],
-            "build-backend": "setuptools.build_meta"
+# Détermination du nom de paquet
+if PYPROJECT.exists():
+    PKG_NAME = toml.load(PYPROJECT)["project"]["name"]
+else:
+    PKG_NAME = os.getenv("PKG_NAME") or ROOT.name.replace(" ", "_")
+
+# ────────────────────────── PIPELINE ────────────────────────────────
+try:
+    with step("Infos GitHub"):
+        user = safe_get("https://api.github.com/user", headers=HEADERS).json()
+        GH_LOGIN = user.get("login") or "unknown"
+        GH_NAME = user.get("name") or GH_LOGIN
+        GH_MAIL = user.get("email") or f"{GH_LOGIN}@users.noreply.github.com"
+
+    with step("Bootstrap fichiers"):
+        if not PYPROJECT.exists():
+            # Avertissement si nom pris sur PyPI
+            if safe_get(f"https://pypi.org/pypi/{PKG_NAME}/json").status_code == 200:
+                log("Bootstrap fichiers", f"Nom « {PKG_NAME} » déjà présent sur PyPI.")
+            PYPROJECT.write_text(
+                toml.dumps(
+                    {
+                        "project": {
+                            "name": PKG_NAME,
+                            "version": "0.0.1",
+                            "readme": "README.md",
+                            "license": {"text": "MIT"},
+                            "authors": [{"name": GH_NAME, "email": GH_MAIL}],
+                            "requires-python": ">=3.8",
+                        },
+                        "build-system": {
+                            "requires": ["setuptools>=64", "wheel"],
+                            "build-backend": "setuptools.build_meta",
+                        },
+                    }
+                )
+            )
+
+        defaults = {
+            "README.md": f"# {PKG_NAME}\n",
+            "LICENSE": "MIT License\n",
+            "MANIFEST.in": "include README.md\ninclude LICENSE\n",
+            ".gitignore": "__pycache__/\n.env\n*.egg-info/\ndist/\nbuild/\n",
         }
-    }))
+        for file, content in defaults.items():
+            path = ROOT / file
+            if not path.exists():
+                path.write_text(content, encoding="utf8")
 
-if not (ROOT / "README.md").exists():
-    (ROOT / "README.md").write_text(f"# {PKG_NAME}\n\nGenerated by deploy_me\n")
-if not (ROOT / "LICENSE").exists():
-    (ROOT / "LICENSE").write_text(
-        "MIT License\n\n"
-        "Permission is hereby granted, free of charge, to any person obtaining a copy "
-        "of this software and associated documentation files..."
+    with step("Nettoyage build"):
+        for d in ("build", "dist"):
+            shutil.rmtree(ROOT / d, ignore_errors=True)
+        for egg in ROOT.glob("*.egg-info"):
+            shutil.rmtree(egg, ignore_errors=True)
+        for p in ROOT.rglob("__pycache__"):
+            shutil.rmtree(p, ignore_errors=True)
+
+    with step("Bump version"):
+        data = toml.load(PYPROJECT)
+        old_version = data["project"]["version"]
+        new_version = bump_patch(old_version)
+        data["project"]["version"] = new_version
+        PYPROJECT.write_text(toml.dumps(data))
+        log("Bump version", f"{old_version} → {new_version}")
+
+    with step("Frontend (si présent)"):
+        pkg_json = next(ROOT.glob("**/package.json"), None)
+        if pkg_json:
+            if shutil.which("npm") is None:
+                raise RuntimeError("npm requis mais introuvable")
+            pkg_data = json.loads(pkg_json.read_text())
+            pkg_data["version"] = new_version
+            pkg_json.write_text(json.dumps(pkg_data, indent=2))
+            run(["npm", "install"], "npm install", cwd=pkg_json.parent, quiet=True)
+            run(["npm", "run", "build"], "npm build", cwd=pkg_json.parent)
+
+    with step("Build & install"):
+        run([sys.executable, "-m", "build"], "python -m build", quiet=True)
+        run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "-e", "."],
+            "pip install -e .",
+            quiet=True,
+        )
+
+    with step("Git init/push"):
+        if not (ROOT / ".git").exists():
+            run(["git", "init"], "git init")
+            run(["git", "add", "."], "git add .")
+            run(["git", "commit", "-m", "Initial commit"], "git commit")
+
+        remotes = (
+            subprocess.run(["git", "remote"], capture_output=True, text=True)
+            .stdout.splitlines()
+        )
+        if "origin" not in remotes:
+            repo_url = f"https://github.com/{GH_LOGIN}/{PKG_NAME}.git"
+            resp = safe_get(repo_url, headers=HEADERS)
+            if resp.status_code == 404:
+                create = requests.post(
+                    "https://api.github.com/user/repos",
+                    headers=HEADERS,
+                    json={"name": PKG_NAME, "private": False},
+                )
+                if create.status_code not in (201, 422):
+                    raise RuntimeError(f"création repo GitHub : {create.text}")
+            run(["git", "remote", "add", "origin", repo_url], "git remote add")
+            run(["git", "branch", "-M", "main"], "git branch -M main")
+            run(["git", "push", "-u", "origin", "main"], "git push -u origin main")
+
+        run(["git", "add", "."], "git add .")
+        run(["git", "commit", "-m", f"patch update #{new_version}"], "git commit")
+        run(["git", "tag", f"v{new_version}"], "git tag v")
+        run(["git", "push"], "git push")
+        run(["git", "push", "--tags"], "git push tags")
+
+    with step("Upload PyPI"):
+        if shutil.which("twine") is None:
+            raise RuntimeError("twine introuvable")
+        run(["twine", "upload", "dist/*"], "twine upload")
+
+    print("🎉  Déploiement terminé sans accroc.")
+
+except KeyboardInterrupt:
+    fail("Global", "interrompu par l’utilisateur")
+except Exception as e:
+    fail(
+        "Global",
+        textwrap.dedent(
+            f"""
+            Erreur inattendue : {type(e).__name__}: {e}
+            Active un mode verbose ou consulte la trace pour le détail.
+            """
+        ).strip(),
     )
-if not (ROOT / "MANIFEST.in").exists():
-    (ROOT / "MANIFEST.in").write_text("include README.md\ninclude LICENSE\n")
-if not (ROOT / ".gitignore").exists():
-    (ROOT / ".gitignore").write_text(
-        "__pycache__/\n.env\n.DS_Store\n*.egg-info/\ndist/\nbuild/\n")
-
-# ----------------------------------------------------------------------
-# 7. Nettoyage build
-# ----------------------------------------------------------------------
-for d in ("build", "dist"):
-    shutil.rmtree(ROOT / d, ignore_errors=True)
-for egg in ROOT.glob("*.egg-info"):
-    shutil.rmtree(egg, ignore_errors=True)
-for p in ROOT.rglob("__pycache__"):
-    shutil.rmtree(p, ignore_errors=True)
-
-# ----------------------------------------------------------------------
-# 8. Bump version dans pyproject.toml
-# ----------------------------------------------------------------------
-data = toml.load(PYPROJECT)
-old_version = data["project"]["version"]
-new_version = bump_patch(old_version)
-data["project"]["version"] = new_version
-PYPROJECT.write_text(toml.dumps(data))
-print(f"🔖 Version : {old_version} → {new_version}")
-
-# ----------------------------------------------------------------------
-# 9. Frontend éventuel
-# ----------------------------------------------------------------------
-pkg_json = next(ROOT.glob("**/package.json"), None)
-if pkg_json:
-    with pkg_json.open() as f:
-        pkg = json.load(f)
-    v_old = pkg.get("version", "0.0.0")
-    v_new = bump_patch(v_old)
-    pkg["version"] = v_new
-    pkg_json.write_text(json.dumps(pkg, indent=2))
-    run(["npm", "install"], cwd=pkg_json.parent)
-    run(["npm", "run", "build"], cwd=pkg_json.parent)
-    print(f"🌐 Frontend version : {v_old} → {v_new}")
-
-# ----------------------------------------------------------------------
-# 10. Build Python
-# ----------------------------------------------------------------------
-run([sys.executable, "-m", "build"])
-
-# ----------------------------------------------------------------------
-# 11. Installation locale editable
-# ----------------------------------------------------------------------
-run([sys.executable, "-m", "pip", "install", "--upgrade", "-e", "."])
-print("✅ Paquet installé/à-jour localement (-e).")
-
-# ----------------------------------------------------------------------
-# 12. Initialisation Git si besoin
-# ----------------------------------------------------------------------
-if not (ROOT / ".git").exists():
-    git("init")
-    git("add", ".")
-    git("commit", "-m", "Initial commit")
-    print("🗂️  Dépôt Git initialisé.")
-
-# ----------------------------------------------------------------------
-# 13. Création repo GitHub & remote origin si absent
-# ----------------------------------------------------------------------
-remotes = subprocess.run(["git", "remote"], capture_output=True,
-                         text=True).stdout.strip().splitlines()
-if "origin" not in remotes:
-    repo_url = f"https://github.com/{GH_LOGIN}/{PKG_NAME}.git"
-    create = requests.post("https://api.github.com/user/repos",
-                           headers=HEADERS,
-                           json={"name": PKG_NAME, "private": False})
-    if create.status_code not in (201, 422):  # 422 = déjà existant
-        sys.exit(f"❌ Erreur création repo GitHub : {create.text}")
-    git("remote", "add", "origin", repo_url)
-    git("branch", "-M", "main")
-    git("push", "-u", "origin", "main")
-    print(f"🌍 Repo GitHub prêt : {repo_url}")
-
-# ----------------------------------------------------------------------
-# 13 bis. Harmoniser le nom du repo si le pyproject a changé
-# ----------------------------------------------------------------------
-def current_remote_repo():
-    url = subprocess.run(["git", "remote", "get-url", "origin"],
-                         capture_output=True, text=True).stdout.strip()
-    # formats possibles : https://github.com/user/repo.git  ou  git@github.com:user/repo.git
-    repo_slug = url.rsplit("/", 1)[-1].removesuffix(".git")
-    return repo_slug
-
-remote_repo_name = current_remote_repo()
-
-if remote_repo_name != PKG_NAME:
-    print(f"🔄 Le repo GitHub s’appelle « {remote_repo_name} », "
-          f"mais le paquet est « {PKG_NAME} » → renommage…")
-
-    # 1. rename via GitHub API
-    patch = requests.patch(
-        f"https://api.github.com/repos/{GH_LOGIN}/{remote_repo_name}",
-        headers=HEADERS,
-        json={"name": PKG_NAME}
-    )
-    if patch.status_code not in (200, 201):
-        sys.exit(f"❌ Impossible de renommer le repo GitHub : {patch.text}")
-
-    # 2. mettre à jour l'URL du remote local
-    new_url = f"https://github.com/{GH_LOGIN}/{PKG_NAME}.git"
-    git("remote", "set-url", "origin", new_url)
-    print(f"✅ Renommé → {new_url}")
-
-    # 3. avertissement éventuel sur le dossier
-    if ROOT.name != PKG_NAME:
-        print(f"⚠️  Ton dossier local s’appelle « {ROOT.name} ». "
-              f"Si tu veux l’harmoniser, renomme-le manuellement.")
-        
-# ----------------------------------------------------------------------
-# 14. Commit patch, tag, push
-# ----------------------------------------------------------------------
-git("add", ".")
-git("commit", "-m", f"patch update #{new_version}")
-git("tag", f"v{new_version}")
-git("push")
-git("push", "--tags")
-print(f"🚀 Pushed tag v{new_version}")
-
-# ----------------------------------------------------------------------
-# 15. Upload sur PyPI
-# ----------------------------------------------------------------------
-run(["twine", "upload", "dist/*"])
-print("🎉 Déploiement PyPI terminé !")
