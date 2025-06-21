@@ -1,8 +1,8 @@
-# deploy_me
+# deploy_pkg
 
 > 🚀 Le couteau suisse « one-shot » pour publier un paquet Python en un seul appel.
 
-`deploy_me` automatise **tout** le pipeline :  
+`deploy_pkg` automatise **tout** le pipeline :  
 – bootstrap de projet (pyproject/README/licence/git…)  
 – création de dépôt GitHub + push + tag  
 – build Python & éventuel frontend npm  
@@ -16,7 +16,7 @@ Aucune interaction : lance et profite !
 ## Installation
 
 ```bash
-pip install deploy_me
+pip install deploy-pkg
 ```
 
 ou en local :
@@ -52,7 +52,7 @@ GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Dans le dossier de **ton** projet (vide ou existant) :
 
 ```bash
-deploy-me            # ou : python -m deploy_me
+deploy-pkg            # ou : python -m deploy_pkg
 ```
 
 Le script :
@@ -76,7 +76,7 @@ Le script :
 ```bash
 mkdir awesome
 cd awesome
-deploy-me
+deploy-pkg
 # => crée pyproject, README, etc. puis publie automatiquement
 ```
 
@@ -85,7 +85,7 @@ deploy-me
 ```bash
 cd awesome
 git status         # doit être propre
-deploy-me
+deploy-pkg
 # => bump version, build, push, upload
 ```
 
