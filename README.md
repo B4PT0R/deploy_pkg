@@ -1,128 +1,200 @@
 # deploy_pkg
 
-> 🚀 Le couteau suisse « one-shot » pour publier un paquet Python en un seul appel.
-
-`deploy_pkg` automatise **tout** le pipeline :  
-– bootstrap de projet (pyproject/README/licence/git…)  
-– création de dépôt GitHub + push + tag  
-– build Python & éventuel frontend npm  
-– installation locale (_editable_)  
-– publication PyPI via Twine  
-
-Aucune interaction : lance et profite !
+<p align="center">
+  <b>Zero-click Python package deployment.</b><br>
+  Build → GitHub → PyPI in a single command, without prompts.
+</p>
 
 ---
 
-## Installation
+## ✨ What is it?
+
+**deploy_pkg** is a one-file deployment tool that:
+
+1. Bootstraps a project (creates `pyproject.toml`, `README.md`, `LICENSE`, etc.).
+2. Cleans build artifacts.
+3. Bumps the patch version (`X.Y.Z → X.Y.(Z+1)`).
+4. Builds an optional **frontend** (`npm install && npm run build` if a `package.json` is found).
+5. Builds your Python package (`python -m build`) and installs it locally in *editable* mode.
+6. Initializes a Git repository, or re-uses the existing one.
+7. Creates a **GitHub** repo via the API (if none exists), adds it as `origin`, commits, tags, and pushes.
+8. Uploads the freshly built distribution to **PyPI** with `twine`.
+
+All of that **without asking a single question**.
+
+---
+
+## 🚀 Quick Start
 
 ```bash
-pip install deploy-pkg
+pip install deploy_pkg        # install the script
+deploy-me                    # run it in any project directory
 ```
 
-ou en local :
+* First run in an **empty folder**?  
+  → deploy_pkg scaffolds a minimal package and publishes it immediately.
+
+* Run it again later?  
+  → deploy_pkg just bumps the version, rebuilds, commits, tags and republishes.
+
+---
+
+## 📦 Installation
+
+### From PyPI
 
 ```bash
-git clone https://github.com/<toi>/deploy_me.git
-cd deploy_me
+pip install deploy_pkg
+```
+
+### From source
+
+```bash
+git clone https://github.com/<you>/deploy_pkg.git
+cd deploy_pkg
 pip install -e .
 ```
 
 ---
 
-## Pré-requis
+## 🔧 Prerequisites
 
-| Outil               | Rôle                                  |
-|---------------------|---------------------------------------|
-| **git**             | versionnage + push GitHub             |
-| **Python ≥ 3.8**    | exécution du script                   |
-| **GITHUB_TOKEN**    | droits `repo` + `user:email`          |
-| _(optionnel)_ **npm** | build du dossier `frontend/` (si présent) |
+| Tool / Env var      | Purpose                                        |
+|---------------------|------------------------------------------------|
+| **git**             | version control, pushing to GitHub            |
+| **Python ≥ 3.8**    | runtime                                        |
+| **GITHUB_TOKEN**    | Personal Access Token with `repo` + `user:email` scopes |
+| _(optional)_ **npm**| builds `/frontend` if present                  |
 
-Crée un fichier `.env` :
+Create a **`.env`** file in your project root:
 
 ```env
-GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# PKG_NAME=override_nom_paquet   # (facultatif)
+GITHUB_TOKEN=ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXX
+# PKG_NAME=my_custom_name   # (optional) overrides the default package name
 ```
 
 ---
 
-## Usage
-
-Dans le dossier de **ton** projet (vide ou existant) :
+## 🖥️ Usage
 
 ```bash
-deploy-pkg            # ou : python -m deploy_pkg
+deploy-me          # or:  python -m deploy_pkg
 ```
 
-Le script :
+Works in **any** directory:
 
-1. installe les dépendances manquantes (`build`, `twine`, …)  
-2. crée les fichiers de base s’ils n’existent pas  
-3. incrémente le patch de version (`0.0.X → 0.0.X+1`)  
-4. construit le paquet (`python -m build`)  
-5. `pip install -U -e .`  
-6. init git / commit / tag / push  
-7. upload `dist/*` sur PyPI  
-
-> **Boom !** Ton paquet est en ligne et déjà installé à jour sur ta machine.
+* **Blank directory** → bootstraps + publishes a first 0.0.1 release.  
+* **Existing package** → bumps patch version, rebuilds, commits & tags.  
+* **Dirty git status** → aborts with a clear error (keeps you safe).
 
 ---
 
-## Exemples
+## How it works – Step by Step
 
-### Publier un tout nouveau projet
+| # | Action | Details |
+|---|--------|---------|
+| 1 | _Requirements_ | Checks for `git`, installs missing Python libs (`build`, `twine`, `toml`, `requests`, `python-dotenv`). |
+| 2 | _Scaffolding_  | Creates `pyproject.toml`, `README.md`, `LICENSE`, `MANIFEST.in`, `.gitignore` if absent. |
+| 3 | _Clean_        | Removes `build/`, `dist/`, `*.egg-info`, `__pycache__`. |
+| 4 | _Version bump_ | Reads `project.version` from *pyproject*, increments patch. |
+| 5 | _Frontend_     | If a `package.json` exists anywhere: bumps its `version`, runs `npm install` & `npm run build`. |
+| 6 | _Build & install_ | `python -m build` then `pip install -U -e .` |
+| 7 | _Git / GitHub_ | Init repo, create GitHub repo (via REST API), add remote, commit `"patch update #<ver>"`, tag `v<ver>`, push. |
+| 8 | _Publish_      | `twine upload dist/*` – your new package is live on PyPI. |
+
+Any failure aborts the pipeline with a **clear, human-friendly error**.
+
+---
+
+## CLI Flags
+
+_No flags yet._ deploy_pkg is intentionally minimal – but a `--dry-run` or
+`--verbose` flag is planned (see Roadmap).
+
+---
+
+## Examples
+
+### First-time release
 
 ```bash
-mkdir awesome
-cd awesome
-deploy-pkg
-# => crée pyproject, README, etc. puis publie automatiquement
+mkdir awesome_pkg
+cd awesome_pkg
+deploy-me
+# → 0.0.1 built, repo created on GitHub, uploaded to PyPI, installed locally
 ```
 
-### Publier un projet déjà existant
+### Routine patch release
 
 ```bash
-cd awesome
-git status         # doit être propre
-deploy-pkg
-# => bump version, build, push, upload
+cd awesome_pkg
+git status   # should be clean
+deploy-me
+# → 0.0.2 built, commit, tag v0.0.2, push, PyPI upload
+```
+
+### Using a custom package name
+
+```bash
+echo "PKG_NAME=super_lib" >> .env
+deploy-me
 ```
 
 ---
 
-## Dépendances runtime
+## 🛡️ Security
 
-- `requests`
-- `toml`
-- `python-dotenv`
-
-Les outils « build » (`build`, `twine`) sont installés à la volée si absents.
+* Access tokens are **never printed**.
+* Git working tree must be **clean** or the run aborts (prevents accidental commits).
+* Network operations (`requests`) use a 10-second timeout and explicit error handling.
 
 ---
 
-## Pourquoi pas un simple *Makefile* ?
+## 🛠  Contributing
 
-Parce que :
-
-- tu oublies toujours une étape (« Twine ? tag git ? bump ?… »)  
-- ça détecte et installe ce qu’il manque (git, deps Python, npm)  
-- aucun copier-coller : **un fichier, une commande, fini**.
-
----
-
-## Contribuer
-
-Les MR / PR sont les bienvenues.  
-Avant de pousser :
+Pull Requests welcome!  
+Clone the repo, install dev deps, run tests (to be added):
 
 ```bash
-python -m pip install -e ".[dev]"
+pip install -e ".[dev]"
 pytest
 ```
 
+Feel free to open issues for feature requests or bug reports.
+
 ---
 
-## Licence
+## 🗺️ Roadmap
 
-MIT – fais-en bon usage, améliore-le, partage-le !
+* `--dry-run` flag (show all steps, no side-effects)  
+* Colorised logging (`rich`)  
+* Pre-/post-deploy hooks  
+* Config file for per-project overrides  
+* Verbose mode with full traceback
+
+---
+
+## 🙋 Author
+
+**Baptiste** – math teacher, Python developer, and despiser of tedious release checklists.
+
+---
+
+## 📝 License
+
+deploy_pkg is released under the **MIT License** – do whatever you want,
+just keep the copyright.
+
+---
+
+## ❤️ Acknowledgements
+
+Inspired by the hundreds of times we forgot one of the following:
+
+* bumping the version number  
+* tagging the commit  
+* uploading with Twine  
+* pushing the tag  
+* building the frontend first…
+
+deploy_pkg never forgets.
