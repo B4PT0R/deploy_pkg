@@ -27,8 +27,8 @@ All of that **without asking a single question**.
 ## 🚀 Quick Start
 
 ```bash
-pip install deploy_pkg        # install the script
-deploy-me                    # run it in any project directory
+pip install deploy-pkg        # install the script
+deploy-pkg                    # run it in any project directory
 ```
 
 * First run in an **empty folder**?  
@@ -78,7 +78,7 @@ GITHUB_TOKEN=ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ## 🖥️ Usage
 
 ```bash
-deploy-me          # or:  python -m deploy_pkg
+deploy-pkg          # or:  python -m deploy_pkg
 ```
 
 Works in **any** directory:
@@ -120,7 +120,7 @@ _No flags yet._ deploy_pkg is intentionally minimal – but a `--dry-run` or
 ```bash
 mkdir awesome_pkg
 cd awesome_pkg
-deploy-me
+deploy-pkg
 # → 0.0.1 built, repo created on GitHub, uploaded to PyPI, installed locally
 ```
 
@@ -129,7 +129,7 @@ deploy-me
 ```bash
 cd awesome_pkg
 git status   # should be clean
-deploy-me
+deploy-pkg
 # → 0.0.2 built, commit, tag v0.0.2, push, PyPI upload
 ```
 
@@ -137,7 +137,7 @@ deploy-me
 
 ```bash
 echo "PKG_NAME=super_lib" >> .env
-deploy-me
+deploy-pkg
 ```
 
 ---
